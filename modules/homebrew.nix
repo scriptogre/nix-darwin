@@ -8,6 +8,12 @@ let
 
   brewfileFile = pkgs.writeText "Brewfile" cfg.brewfile;
 
+  fastPathIdentity = pkgs.writeText "homebrew-activation-identity" (builtins.toJSON {
+    version = 1;
+    inherit (cfg) brewfile prefix user;
+    inherit (cfg.onActivation) cleanup extraEnv;
+  });
+
   # Brewfile creation helper functions -------------------------------------------------------------
 
   mkBrewfileSectionString = heading: entries: optionalString (entries != [ ]) ''
@@ -172,7 +178,23 @@ let
         '';
       };
 
+      fastPath = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Whether to skip {command}`brew bundle` when the generated Brewfile, activation options,
+          and installed Homebrew inventory are unchanged since the last successful activation.
+
+          The inventory includes taps, formulae, casks, and Mac App Store applications. The fast
+          path requires [](#opt-homebrew.onActivation.autoUpdate) and
+          [](#opt-homebrew.onActivation.upgrade) to be disabled. It does not support arbitrary
+          Brewfile directives, extra flags, Visual Studio Code extensions, Go packages, Cargo
+          packages, or formula options that reconcile link, conflict, or service state.
+        '';
+      };
+
       brewBundleCmd = mkInternalOption { type = types.functionTo types.str; };
+      inventoryCmd = mkInternalOption { type = types.str; };
     };
 
     config = {
@@ -197,6 +219,33 @@ let
             ++ optional (config.cleanup == "zap") "--zap --force-cleanup"
             ++ config.extraFlags
         )
+      );
+
+      inventoryCmd = concatStringsSep " " (
+        [
+          ''PATH="${cfg.prefix}/bin:${lib.makeBinPath [ pkgs.mas ]}:$PATH"''
+          "sudo"
+          "--preserve-env=PATH"
+          "--user=${escapeShellArg cfg.user}"
+          "--set-home"
+          "env"
+        ]
+        ++ mapAttrsToList (k: v: "${k}=${escapeShellArg v}") config.extraEnv
+        ++ [
+          "/bin/sh"
+          "-c"
+          (escapeShellArg ''
+            set -e
+            printf '%s\n' '[taps]'
+            brew tap | LC_ALL=C sort
+            printf '%s\n' '[formulae]'
+            brew list --formula -1 | LC_ALL=C sort
+            printf '%s\n' '[casks]'
+            brew list --cask -1 | LC_ALL=C sort
+            printf '%s\n' '[mas]'
+            mas list | LC_ALL=C sort
+          '')
+        ]
       );
     };
   };
@@ -958,6 +1007,49 @@ in
       (mkIf (hasSuffix "/bin" cfg.prefix) "`homebrew.prefix` should be the Homebrew prefix directory (e.g., `/opt/homebrew`), not the bin directory. The value should match what `brew --prefix` returns. Did you mean to remove the trailing `/bin`?")
     ];
 
+    assertions = [
+      {
+        assertion = !cfg.onActivation.fastPath || !cfg.onActivation.autoUpdate;
+        message = "`homebrew.onActivation.fastPath` requires `homebrew.onActivation.autoUpdate = false`.";
+      }
+      {
+        assertion = !cfg.onActivation.fastPath || !cfg.onActivation.upgrade;
+        message = "`homebrew.onActivation.fastPath` requires `homebrew.onActivation.upgrade = false`.";
+      }
+      {
+        assertion = !cfg.onActivation.fastPath || cfg.onActivation.extraFlags == [ ];
+        message = "`homebrew.onActivation.fastPath` does not support `homebrew.onActivation.extraFlags`.";
+      }
+      {
+        assertion = !cfg.onActivation.fastPath || cfg.vscode == [ ];
+        message = "`homebrew.onActivation.fastPath` does not support `homebrew.vscode`.";
+      }
+      {
+        assertion = !cfg.onActivation.fastPath || cfg.goPackages == [ ];
+        message = "`homebrew.onActivation.fastPath` does not support `homebrew.goPackages`.";
+      }
+      {
+        assertion = !cfg.onActivation.fastPath || cfg.cargoPackages == [ ];
+        message = "`homebrew.onActivation.fastPath` does not support `homebrew.cargoPackages`.";
+      }
+      {
+        assertion = !cfg.onActivation.fastPath || cfg.extraConfig == "";
+        message = "`homebrew.onActivation.fastPath` does not support `homebrew.extraConfig`.";
+      }
+      {
+        assertion = !cfg.onActivation.fastPath
+          || !any
+          (brew:
+            brew.conflicts_with != null
+              || brew.link != null
+              || brew.restart_service != null
+              || brew.start_service != null
+          )
+          cfg.brews;
+        message = "`homebrew.onActivation.fastPath` does not support formula state options (`conflicts_with`, `link`, `restart_service`, or `start_service`).";
+      }
+    ];
+
     system.requiresPrimaryUser = mkIf (cfg.enable && options.homebrew.user.highestPrio == (mkOptionDefault {}).priority) [
       "homebrew.enable"
     ];
@@ -1030,7 +1122,32 @@ in
       # Homebrew Bundle
       echo >&2 "Homebrew bundle..."
       if [ -f "${cfg.prefix}/bin/brew" ]; then
-        ${cfg.onActivation.brewBundleCmd { onlyCheck = false; }}
+        ${if cfg.onActivation.fastPath then ''
+          homebrewStateDir=/var/db/nix-darwin/homebrew
+          homebrewState="$homebrewStateDir/activation-state"
+          mkdir -p "$homebrewStateDir"
+          homebrewStateNext=$(mktemp "$homebrewStateDir/.activation-state.XXXXXX")
+          trap 'rm -f "$homebrewStateNext"' EXIT
+
+          writeHomebrewState() {
+            printf '%s\n' ${escapeShellArg fastPathIdentity} > "$homebrewStateNext"
+            homebrewInventory=$(${cfg.onActivation.inventoryCmd})
+            printf '%s\n' "$homebrewInventory" >> "$homebrewStateNext"
+          }
+
+          writeHomebrewState
+
+          if cmp -s "$homebrewState" "$homebrewStateNext"; then
+            echo >&2 "Homebrew inventory unchanged, skipping bundle."
+          else
+            ${cfg.onActivation.brewBundleCmd { onlyCheck = false; }}
+            writeHomebrewState
+            mv -f "$homebrewStateNext" "$homebrewState"
+          fi
+
+          rm -f "$homebrewStateNext"
+          trap - EXIT
+        '' else cfg.onActivation.brewBundleCmd { onlyCheck = false; }}
       else
         echo -e "\e[1;31merror: Homebrew is not installed, skipping...\e[0m" >&2
       fi

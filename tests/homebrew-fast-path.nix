@@ -41,11 +41,12 @@ in
       activate=${config.out}/activate
       bash -n "$activate"
 
-      echo "checking fast path inventory" >&2
-      grep -F "brew tap | LC_ALL=C sort" "$activate"
-      grep -F "brew list --formula -1 | LC_ALL=C sort" "$activate"
-      grep -F "brew list --cask -1 | LC_ALL=C sort" "$activate"
-      grep -F "mas list | LC_ALL=C sort" "$activate"
+    echo "checking fast path inventory" >&2
+    grep -F 'brew tap > "$inventoryDir/taps"' "$activate"
+    grep -F 'brew list --formula -1 > "$inventoryDir/formulae"' "$activate"
+    grep -F 'brew list --cask -1 > "$inventoryDir/casks"' "$activate"
+    grep -F 'mas list > "$inventoryDir/mas"' "$activate"
+    grep -F 'LC_ALL=C sort "$inventoryDir/formulae"' "$activate"
 
       echo "checking fast path cache" >&2
       grep -F "homebrewStateDir=/var/db/nix-darwin/homebrew" "$activate"

@@ -236,14 +236,21 @@ let
           "-c"
           (escapeShellArg ''
             set -e
+            inventoryDir=$(mktemp -d)
+            trap 'rm -rf "$inventoryDir"' EXIT
+            brew tap > "$inventoryDir/taps"
+            brew list --formula -1 > "$inventoryDir/formulae"
+            brew list --cask -1 > "$inventoryDir/casks"
+            mas list > "$inventoryDir/mas"
+
             printf '%s\n' '[taps]'
-            brew tap | LC_ALL=C sort
+            LC_ALL=C sort "$inventoryDir/taps"
             printf '%s\n' '[formulae]'
-            brew list --formula -1 | LC_ALL=C sort
+            LC_ALL=C sort "$inventoryDir/formulae"
             printf '%s\n' '[casks]'
-            brew list --cask -1 | LC_ALL=C sort
+            LC_ALL=C sort "$inventoryDir/casks"
             printf '%s\n' '[mas]'
-            mas list | LC_ALL=C sort
+            LC_ALL=C sort "$inventoryDir/mas"
           '')
         ]
       );

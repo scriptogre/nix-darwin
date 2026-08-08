@@ -8,7 +8,7 @@ let
 
   brewfileFile = pkgs.writeText "Brewfile" cfg.brewfile;
 
-  fastPathIdentity = pkgs.writeText "homebrew-activation-identity" (builtins.toJSON {
+  reconciliationIdentity = pkgs.writeText "homebrew-activation-identity" (builtins.toJSON {
     version = 1;
     inherit (cfg) brewfile prefix user;
     inherit (cfg.onActivation) cleanup extraEnv;
@@ -178,15 +178,15 @@ let
         '';
       };
 
-      fastPath = mkOption {
+      skipBundleIfUnchanged = mkOption {
         type = types.bool;
         default = false;
         description = ''
           Whether to skip {command}`brew bundle` when the generated Brewfile, activation options,
-          and installed Homebrew inventory are unchanged since the last successful activation.
+          and installed Homebrew inventory have not changed since the last successful activation.
 
-          The inventory includes taps, formulae, casks, and Mac App Store applications. The fast
-          path requires [](#opt-homebrew.onActivation.autoUpdate) and
+          The inventory includes taps, formulae, casks, and Mac App Store applications. Skipping an
+          unchanged bundle requires [](#opt-homebrew.onActivation.autoUpdate) and
           [](#opt-homebrew.onActivation.upgrade) to be disabled. It does not support arbitrary
           Brewfile directives, extra flags, Visual Studio Code extensions, Go packages, Cargo
           packages, or formula options that reconcile link, conflict, or service state.
@@ -195,6 +195,7 @@ let
 
       brewBundleCmd = mkInternalOption { type = types.functionTo types.str; };
       inventoryCmd = mkInternalOption { type = types.str; };
+      skipBundleIfUnchangedCmd = mkInternalOption { type = types.functionTo types.str; };
     };
 
     config = {
@@ -241,7 +242,8 @@ let
             brew tap > "$inventoryDir/taps"
             brew list --formula -1 > "$inventoryDir/formulae"
             brew list --cask -1 > "$inventoryDir/casks"
-            mas list > "$inventoryDir/mas"
+            mas list > "$inventoryDir/mas-with-versions"
+            awk '{ print $1 }' "$inventoryDir/mas-with-versions" > "$inventoryDir/mas"
 
             printf '%s\n' '[taps]'
             LC_ALL=C sort "$inventoryDir/taps"
@@ -254,6 +256,41 @@ let
           '')
         ]
       );
+
+      skipBundleIfUnchangedCmd = {
+        stateDir ? "/var/db/nix-darwin/homebrew",
+        inventoryCmd ? config.inventoryCmd,
+        bundleCmd ? config.brewBundleCmd { onlyCheck = false; }
+      }: ''
+        (
+          set -e
+
+          homebrewStateDir=${escapeShellArg stateDir}
+          homebrewState="$homebrewStateDir/activation-state"
+          mkdir -p "$homebrewStateDir"
+          homebrewStateNext=$(mktemp "$homebrewStateDir/.activation-state.XXXXXX")
+          trap 'rm -f "$homebrewStateNext"' EXIT
+
+          writeHomebrewState() {
+            printf '%s\n' ${escapeShellArg reconciliationIdentity} > "$homebrewStateNext"
+            homebrewInventory=$(${inventoryCmd})
+            printf '%s\n' "$homebrewInventory" >> "$homebrewStateNext"
+          }
+
+          writeHomebrewState
+
+          if cmp -s "$homebrewState" "$homebrewStateNext"; then
+            echo >&2 "Homebrew inventory unchanged, skipping bundle."
+          else
+            ${bundleCmd}
+            writeHomebrewState
+            mv -f "$homebrewStateNext" "$homebrewState"
+          fi
+
+          rm -f "$homebrewStateNext"
+          trap - EXIT
+        )
+      '';
     };
   };
 
@@ -1016,35 +1053,35 @@ in
 
     assertions = [
       {
-        assertion = !cfg.onActivation.fastPath || !cfg.onActivation.autoUpdate;
-        message = "`homebrew.onActivation.fastPath` requires `homebrew.onActivation.autoUpdate = false`.";
+        assertion = !cfg.onActivation.skipBundleIfUnchanged || !cfg.onActivation.autoUpdate;
+        message = "`homebrew.onActivation.skipBundleIfUnchanged` requires `homebrew.onActivation.autoUpdate = false`.";
       }
       {
-        assertion = !cfg.onActivation.fastPath || !cfg.onActivation.upgrade;
-        message = "`homebrew.onActivation.fastPath` requires `homebrew.onActivation.upgrade = false`.";
+        assertion = !cfg.onActivation.skipBundleIfUnchanged || !cfg.onActivation.upgrade;
+        message = "`homebrew.onActivation.skipBundleIfUnchanged` requires `homebrew.onActivation.upgrade = false`.";
       }
       {
-        assertion = !cfg.onActivation.fastPath || cfg.onActivation.extraFlags == [ ];
-        message = "`homebrew.onActivation.fastPath` does not support `homebrew.onActivation.extraFlags`.";
+        assertion = !cfg.onActivation.skipBundleIfUnchanged || cfg.onActivation.extraFlags == [ ];
+        message = "`homebrew.onActivation.skipBundleIfUnchanged` does not support `homebrew.onActivation.extraFlags`.";
       }
       {
-        assertion = !cfg.onActivation.fastPath || cfg.vscode == [ ];
-        message = "`homebrew.onActivation.fastPath` does not support `homebrew.vscode`.";
+        assertion = !cfg.onActivation.skipBundleIfUnchanged || cfg.vscode == [ ];
+        message = "`homebrew.onActivation.skipBundleIfUnchanged` does not support `homebrew.vscode`.";
       }
       {
-        assertion = !cfg.onActivation.fastPath || cfg.goPackages == [ ];
-        message = "`homebrew.onActivation.fastPath` does not support `homebrew.goPackages`.";
+        assertion = !cfg.onActivation.skipBundleIfUnchanged || cfg.goPackages == [ ];
+        message = "`homebrew.onActivation.skipBundleIfUnchanged` does not support `homebrew.goPackages`.";
       }
       {
-        assertion = !cfg.onActivation.fastPath || cfg.cargoPackages == [ ];
-        message = "`homebrew.onActivation.fastPath` does not support `homebrew.cargoPackages`.";
+        assertion = !cfg.onActivation.skipBundleIfUnchanged || cfg.cargoPackages == [ ];
+        message = "`homebrew.onActivation.skipBundleIfUnchanged` does not support `homebrew.cargoPackages`.";
       }
       {
-        assertion = !cfg.onActivation.fastPath || cfg.extraConfig == "";
-        message = "`homebrew.onActivation.fastPath` does not support `homebrew.extraConfig`.";
+        assertion = !cfg.onActivation.skipBundleIfUnchanged || cfg.extraConfig == "";
+        message = "`homebrew.onActivation.skipBundleIfUnchanged` does not support `homebrew.extraConfig`.";
       }
       {
-        assertion = !cfg.onActivation.fastPath
+        assertion = !cfg.onActivation.skipBundleIfUnchanged
           || !any
           (brew:
             brew.conflicts_with != null
@@ -1053,7 +1090,7 @@ in
               || brew.start_service != null
           )
           cfg.brews;
-        message = "`homebrew.onActivation.fastPath` does not support formula state options (`conflicts_with`, `link`, `restart_service`, or `start_service`).";
+        message = "`homebrew.onActivation.skipBundleIfUnchanged` does not support formula state options (`conflicts_with`, `link`, `restart_service`, or `start_service`).";
       }
     ];
 
@@ -1129,32 +1166,9 @@ in
       # Homebrew Bundle
       echo >&2 "Homebrew bundle..."
       if [ -f "${cfg.prefix}/bin/brew" ]; then
-        ${if cfg.onActivation.fastPath then ''
-          homebrewStateDir=/var/db/nix-darwin/homebrew
-          homebrewState="$homebrewStateDir/activation-state"
-          mkdir -p "$homebrewStateDir"
-          homebrewStateNext=$(mktemp "$homebrewStateDir/.activation-state.XXXXXX")
-          trap 'rm -f "$homebrewStateNext"' EXIT
-
-          writeHomebrewState() {
-            printf '%s\n' ${escapeShellArg fastPathIdentity} > "$homebrewStateNext"
-            homebrewInventory=$(${cfg.onActivation.inventoryCmd})
-            printf '%s\n' "$homebrewInventory" >> "$homebrewStateNext"
-          }
-
-          writeHomebrewState
-
-          if cmp -s "$homebrewState" "$homebrewStateNext"; then
-            echo >&2 "Homebrew inventory unchanged, skipping bundle."
-          else
-            ${cfg.onActivation.brewBundleCmd { onlyCheck = false; }}
-            writeHomebrewState
-            mv -f "$homebrewStateNext" "$homebrewState"
-          fi
-
-          rm -f "$homebrewStateNext"
-          trap - EXIT
-        '' else cfg.onActivation.brewBundleCmd { onlyCheck = false; }}
+        ${if cfg.onActivation.skipBundleIfUnchanged
+          then cfg.onActivation.skipBundleIfUnchangedCmd { }
+          else cfg.onActivation.brewBundleCmd { onlyCheck = false; }}
       else
         echo -e "\e[1;31merror: Homebrew is not installed, skipping...\e[0m" >&2
       fi
